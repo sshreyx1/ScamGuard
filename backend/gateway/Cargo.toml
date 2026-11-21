@@ -1,0 +1,22 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+# Oldest Rust this builds with; the Dockerfile pins the same image and Cargo.lock pins every dependency.
+rust-version = "1.90"
+
+[dependencies]
+actix-web = "4"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Workstream H: forwards POST /v1/report to the review service. Already in the build through tonic, so this
+# adds no new crate, only the HTTP/1 client features.
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
+
+[build-dependencies]
+tonic-build = "0.11"

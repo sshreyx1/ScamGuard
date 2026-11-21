@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: money-en
+  namespace: scamguard
+  labels: { app: money-en, signal: money, language: en }
+spec:
+  replicas: 1
+  # H.9 rolling update: start the new pod first, remove an old one only once the new one is ready, so a
+  # version change never drops a line (with 1 replica Kubernetes' defaults round to the same thing).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: money-en }
+  template:
+    metadata:
+      labels: { app: money-en, signal: money, language: en }
+    spec:
+      containers:
+        - name: money-en
+          image: scam/money_en:demo
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: PORT
+              value: "50051"
+            # H.8: set MODEL_VERSION (learning.py rollout) to load a released version from the registry.
+            - name: MODEL_REGISTRY_URL
+              value: "http://review:8090"
+          # Keep serving for a few seconds after Kubernetes decides to stop this pod: Envoy refreshes the pod
+          # list every 2 s, so without this pause it still sends a line or two to a pod that has stopped
+          # (measured: 2 lines without an urgency score during a rolling update; see demo/LEARNING_LOOP.md).
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "384Mi"
+          # A pod that the HPA starts under heavy load loads its model slowly (CPU limit + a busy node). Measured
+          # 2026-11-14: without a startupProbe the 1 s liveness check killed such pods 3-4 times in a row (exit 137),
+          # so they never helped and their restarts kept the HPA scaled up. The startupProbe gives a new pod up to
+          # 2 minutes to answer before liveness starts; the probes also get a 3 s timeout instead of the 1 s default.
+          startupProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+# Headless: Envoy's cluster for this worker needs every pod IP (see make_envoy_config.py).
+apiVersion: v1
+kind: Service
+metadata:
+  name: money-en-hl
+  namespace: scamguard
+  labels: { app: money-en }
+spec:
+  clusterIP: None
+  selector: { app: money-en }
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: money-en
+  namespace: scamguard
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: money-en }
+  minReplicas: 1
+  maxReplicas: 4
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 50 }

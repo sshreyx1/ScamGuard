@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package scam_detect;
+
+// Shared message/service definitions used by:
+//  - gateway (Rust)    -> gRPC client of both services below
+//  - aggregator (Rust) -> implements AggregatorService; gRPC client of BertService
+//  - workers (Python)  -> each implements WorkerService
+//  - bert (Python)     -> implements BertService (the second opinion, see below)
+//
+// Each worker specializes in one (signal, language) pair, e.g.
+// urgency_en, money_zh, impersonation_en, etc. The gateway decides which
+// worker stubs to call based on the detected/validated `language`.
+service WorkerService {
+  rpc ClassifyTranscript(TranscriptRequest) returns (WorkerScore);
+}
+
+// Takes the fanned-out worker scores and produces a final verdict.
+service AggregatorService {
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+  // Workstream B: the call is over (the phone hung up / the script finished), or the aggregator's own silence
+  // timeout. Runs the end-of-call review (or falls back to the live verdict), clears the call's memory and
+  // returns the final verdict. Idempotent: a second EndCall returns the first one's result.
+  rpc EndCall(EndCallRequest) returns (EndCallResponse);
+}
+
+// The BERT second opinion (backend/workers/bert): one multilingual model that reads the call's last few
+// caller lines together and returns P(scam). Slower than the workers, so the aggregator asks it only when the
+// fast vote is unsure or alarmed (or when too few workers answered). This is the "cascade".
+service BertService {
+  rpc ScoreContext(ContextRequest) returns (BertScore);
+}
+
+message ContextRequest {
+  // The call's most recent caller lines, oldest first, this line last (the gateway keeps up to 5).
+  repeated string lines = 1;
+  string language = 2;
+}
+
+message BertScore {
+  // Calibrated probability in [0.0, 1.0] that the conversation so far is a scam.
+  float score = 1;
+  string model_version = 2;
+}
+
+message TranscriptRequest {
+  string transcript = 1;
+  // BCP-47-ish language code, e.g. "en", "zh". TODO: formalize validation
+  // (currently gateway does a naive check, see gateway/src/language.rs).
+  string language = 2;
+}
+
+message WorkerScore {
+  // Which signal this score represents, e.g. "urgency", "money",
+  // "impersonation". Set by the worker itself.
+  string signal = 1;
+  // Classifier confidence/probability in [0.0, 1.0] that the transcript
+  // exhibits this signal.
+  float score = 2;
+  string language = 3;
+  // Workstream H.8: which model version produced this score (e.g. "v5"). Empty = the worker doesn't report
+  // one yet. Additive: older workers and the aggregator simply ignore it.
+  string model_version = 4;
+}
+
+message AggregateRequest {
+  // THIS line's scores: only the workers that answered (a missing worker is simply absent).
+  repeated WorkerScore scores = 1;
+  // Call the line belongs to. The aggregator keeps the call's memory in Redis under call:<call_id>.
+  // Empty = one-shot request with no memory (used by the gateway's /submit-transcript).
+  string call_id = 2;
+  // Line number within the call (0 = not given). Only logged.
+  uint64 seq = 3;
+  // Milliseconds since the call started, as the phone measured it. 0 = use the aggregator's clock.
+  // Lets a scripted replay say "this line was spoken 22 s into the call".
+  int64 call_time_ms = 4;
+  // The call's most recent caller lines, oldest first, this line last (the gateway keeps them in RAM, up to
+  // BERT_CONTEXT_LINES). The aggregator only forwards them to BertService when it wants a second opinion; it
+  // never stores or logs them (Redis stays text-free). Empty = no second opinion possible.
+  repeated string context = 5;
+}
+
+// Why the verdict was given: one entry per signal that fired, strongest first.
+message Reason {
+  string signal = 1;
+  float score = 2;
+  string text = 3;  // e.g. "Asked for your OTP or money"
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  SAFE = 1;
+  UNSURE = 2;
+  SCAM = 3;
+}
+
+message AggregateResponse {
+  Verdict verdict = 1;
+  // Live alert for the call so far. Workstream C will populate final_verdict at call end.
+  Verdict live_alert = 12;
+  string final_verdict = 13;
+  // Weighted average of each signal's recent highest score (weights of missing signals are shared out).
+  float combined_score = 2;
+  repeated Reason reasons = 3;
+  // One suggested action for the user; empty when SAFE.
+  string action = 4;
+  // Each signal's highest score over the call's recent caller lines (what combined_score is built from).
+  map<string, float> recent_scores = 5;
+  // True inside the call's first seconds, when the aggregator stays quiet unless a score is very high.
+  bool warming_up = 6;
+  // False when fewer than the minimum number of workers answered this line.
+  bool quorum_met = 7;
+  // Caller lines seen for this call so far.
+  uint32 caller_lines = 8;
+  // The workers' weighted vote alone, before BERT. combined_score is what the verdict was decided on:
+  // equal to fast_score when BERT was not asked or did not answer.
+  float fast_score = 9;
+  // BERT's score when it was asked and answered in time.
+  optional float bert_score = 10;
+  // "ok" | "timeout" | "error" (asked but no score) | "skipped" (not needed) | "off" (BERT_ADDR not set)
+  string bert_status = 11;
+  // Workstream B.6: the call has already ended. This line was NOT scored or stored; the other fields are empty.
+  // (14, not 12: Workstream A took 12 and 13 for live_alert / final_verdict.)
+  bool call_ended = 14;
+  // H.8: BERT's model version when it answered this line (bert_status "ok"); empty otherwise.
+  string bert_model_version = 15;
+}
+
+// Workstream B: one caller line sent with the end message, for the end-of-call review. Passed through and
+// dropped: never stored or logged (Redis stays text-free).
+message CallerLine {
+  int64 seq = 1;
+  string text = 2;
+}
+
+message EndCallRequest {
+  string call_id = 1;
+  // script_finished | user_hung_up | user_discarded | silence (the last one only from the aggregator itself)
+  string ended_by = 2;
+  // The phone's last line number. Only logged.
+  int64 last_seq = 3;
+  // All of the call's caller lines, oldest first. Empty = no review possible (the live verdict is used).
+  repeated CallerLine caller_lines = 4;
+  // "en" | "zh" | "" : the language of caller_lines, for the review.
+  string language = 5;
+}
+
+message EndCallResponse {
+  string call_id = 1;
+  // VERDICT_UNSPECIFIED = the call was never seen (no caller line was scored); the gateway says "UNKNOWN".
+  Verdict final_verdict = 2;
+  float call_score = 3;
+  // The verdict after the call's last caller line.
+  Verdict live_verdict = 4;
+  // "bert" (the end-of-call review answered) | "fallback" (the live verdict is the final one)
+  string review = 5;
+  // Line numbers of the riskiest window of caller lines ("the conversation turned risky here"). Never text.
+  repeated int64 top_window_seqs = 6;
+  // Fixed reason text for the strongest signal, e.g. "Asked for your OTP or money". Empty when SAFE.
+  string reason = 7;
+  // What ended the call first (a repeated end keeps the first value).
+  string ended_by = 8;
+  // True when this call had already ended before this request (nothing was run again).
+  bool already_ended = 9;
+}
